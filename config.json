@@ -1,5 +1,6 @@
 {
-  "max_concurrency": 2,
+  "fast_slots": 4,
+  "slow_slots": 4,
   "idle_reclaim_seconds": 120,
   "keepalive_interval_seconds": 60,
   "queue_policy": "priority"

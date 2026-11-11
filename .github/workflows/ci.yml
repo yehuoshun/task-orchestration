@@ -17,8 +17,17 @@ jobs:
       - name: 语法检查
         run: python3 -m py_compile scripts/dispatch.py
 
-      - name: 配置合法性
-        run: python3 -c "import json;d=json.load(open('config.json'));assert d['max_concurrency']>=1;assert d['idle_reclaim_seconds']>0"
+      - name: 配置合法性（双通道）
+        run: |
+          python3 - <<'EOF'
+          import json
+          d = json.load(open('config.json'))
+          assert d['fast_slots'] >= 1
+          assert d['slow_slots'] >= 0
+          assert d['idle_reclaim_seconds'] > 0
+          assert d['keepalive_interval_seconds'] > 0
+          print("容量:", d['fast_slots'], "+", d['slow_slots'])
+          EOF
 
       - name: 冒烟：细分 / 发牌 / 依赖闸 / 收尾
         run: |
@@ -41,21 +50,57 @@ jobs:
           $S finish T1 --project ci
           $S next --project ci --json | grep -q '"T2"'
 
-      - name: 冒烟：并发闸 + 插队抢占
+      - name: 冒烟：双通道——先手顺序先快后慢 + 两通道满闸
         run: |
           set -e
           S="python3 scripts/dispatch.py"
-          $S config set max_concurrency 1 >/dev/null
-          $S init --project ci2 --goal "并发闸"
-          $S add  --project ci2 --title A
-          $S add  --project ci2 --title B --priority low
-          $S start T1 --project ci2 --session s1
-          # 槽满必须被拒
-          if $S start T2 --project ci2 >/dev/null 2>&1; then
-            echo "并发已满竟然放行"; exit 1
+          $S config set fast_slots 2 >/dev/null
+          $S config set slow_slots 1 >/dev/null
+          $S init --project ci_lane --goal "双通道"
+          for i in 1 2 3 4; do $S add --project ci_lane --title "任务$i" >/dev/null; done
+
+          # 3 个槽：fast#1 fast#2 slow#1，第 4 个不应被分派
+          picks=$($S next --project ci_lane --json | grep -c '"slot"')
+          [ "$picks" = "3" ] || { echo "应分派 3 个，实际 $picks"; exit 1; }
+          $S next --project ci_lane --json | grep -q '"fast#1"'
+          $S next --project ci_lane --json | grep -q '"slow#1"'
+
+          $S start T1 --project ci_lane --session s1 --json | grep -q '"lane": "fast"'
+          $S start T2 --project ci_lane --session s2 --json | grep -q '"lane": "fast"'
+          $S start T3 --project ci_lane --session s3 --json | grep -q '"lane": "slow"'
+          # 两通道都满必须被拒
+          if $S start T4 --project ci_lane >/dev/null 2>&1; then
+            echo "双通道已满竟然放行"; exit 1
           fi
-          $S insert T2 --project ci2 --mode preempt --json | grep -q '"victim"'
-          $S config set max_concurrency 2 >/dev/null
+
+          # 释放一个快槽 → 下一个任务进 fast
+          $S finish T2 --project ci_lane >/dev/null
+          $S next --project ci_lane --json | grep -q '"lane": "fast"'
+
+          # relane 校正：快 → 慢（慢已满应被拒，--force 可硬改）
+          if $S relane T1 --project ci_lane --lane slow >/dev/null 2>&1; then
+            echo "慢通道已满竟然允许 relane"; exit 1
+          fi
+          $S relane T1 --project ci_lane --lane slow --force --json | grep -q '"new": "slow"'
+
+      - name: 冒烟：插队 + 抢占优先冻结快通道
+        run: |
+          set -e
+          S="python3 scripts/dispatch.py"
+          $S config set fast_slots 1 >/dev/null
+          $S config set slow_slots 1 >/dev/null
+          $S init --project ci2 --goal "抢占"
+          $S add  --project ci2 --title A --priority high
+          $S add  --project ci2 --title B --priority low
+          $S add  --project ci2 --title C --priority urgent
+          $S start T1 --project ci2 --session s1 >/dev/null
+          $S start T2 --project ci2 --session s2 >/dev/null
+          # 两通道满，抢占：应优先冻结快通道的 T1（即使 T2 优先级更低，快槽才给得了急活）
+          out=$($S insert T3 --project ci2 --mode preempt --json)
+          echo "$out" | grep -q '"victim": "T1"' || { echo "抢占没优先冻快通道: $out"; exit 1; }
+          echo "$out" | grep -q '"victim_lane": "fast"'
+          $S config set fast_slots 4 >/dev/null
+          $S config set slow_slots 4 >/dev/null
 
       - name: 冒烟：保活巡检退出码
         run: |
