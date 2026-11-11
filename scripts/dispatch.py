@@ -431,6 +431,9 @@ def cmd_config(a):
 
 
 def main():
+    # --json 可以放在子命令前后任意位置
+    if "--json" in sys.argv[1:]:
+        sys.argv = [sys.argv[0], "--json"] + [x for x in sys.argv[1:] if x != "--json"]
     ap = argparse.ArgumentParser(description="任务执行规范调度器")
     ap.add_argument("--json", action="store_true", help="JSON 输出")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -476,4 +479,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        os._exit(0)
