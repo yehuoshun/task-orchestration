@@ -1,0 +1,6 @@
+{
+  "max_concurrency": 2,
+  "idle_reclaim_seconds": 120,
+  "keepalive_interval_seconds": 60,
+  "queue_policy": "priority"
+}

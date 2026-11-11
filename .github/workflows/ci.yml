@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 语法检查
+        run: python3 -m py_compile scripts/dispatch.py
+
+      - name: 配置合法性
+        run: python3 -c "import json;d=json.load(open('config.json'));assert d['max_concurrency']>=1;assert d['idle_reclaim_seconds']>0"
+
+      - name: 冒烟：细分 / 发牌 / 依赖闸 / 收尾
+        run: |
+          set -e
+          S="python3 scripts/dispatch.py"
+          $S init --project ci --goal "CI 冒烟"
+          $S add  --project ci --title A --priority high
+          $S add  --project ci --title B --parent T1 --deps T1
+          $S add  --project ci --title C --parent T1 --deps T2 --priority low
+
+          $S next --project ci --json | grep -q '"T1"'
+
+          $S start T1 --project ci --session s1
+          # 依赖未完成必须被拒
+          if $S start T2 --project ci >/dev/null 2>&1; then
+            echo "依赖未完成竟然放行"; exit 1
+          fi
+          $S plan --project ci | grep -q "T2"
+
+          $S finish T1 --project ci
+          $S next --project ci --json | grep -q '"T2"'
+
+      - name: 冒烟：并发闸 + 插队抢占
+        run: |
+          set -e
+          S="python3 scripts/dispatch.py"
+          $S config set max_concurrency 1 >/dev/null
+          $S init --project ci2 --goal "并发闸"
+          $S add  --project ci2 --title A
+          $S add  --project ci2 --title B --priority low
+          $S start T1 --project ci2 --session s1
+          # 槽满必须被拒
+          if $S start T2 --project ci2 >/dev/null 2>&1; then
+            echo "并发已满竟然放行"; exit 1
+          fi
+          $S insert T2 --project ci2 --mode preempt --json | grep -q '"victim"'
+          $S config set max_concurrency 2 >/dev/null
+
+      - name: 冒烟：保活巡检退出码
+        run: |
+          S="python3 scripts/dispatch.py"
+          $S init --project ci3 --goal "保活"
+          $S add  --project ci3 --title A
+          $S start T1 --project ci3 --session s1
+          $S heartbeat T1 --project ci3
+          $S tick --project ci3
+          echo "tick ok"
